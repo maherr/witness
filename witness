@@ -77,7 +77,7 @@ LEDGER_FIELDS = (
 )
 LEDGER_ENUMS = {
     "transcription_engine": {LEDGER_ENGINE},
-    "transcription_backend": {"vulkan", "gguf-cpu", "mixed"},
+    "transcription_backend": {"vulkan", "cuda", "gguf-cpu", "mixed"},
     "status": {"started", "completed", "failed"},
     "stage": {
         "validation",
@@ -309,7 +309,7 @@ def append_ledger_record(record: dict) -> bool:
 
 def normalize_diarizer_backend(value: str | None) -> str:
     normalized = (value or "").lower()
-    if normalized in {"gpu", "migraphx"}:
+    if normalized in {"gpu", "migraphx", "cuda", "cuda-fast"}:
         return "gpu"
     if normalized == "cpu":
         return "cpu"
@@ -320,7 +320,7 @@ def normalize_diarizer_backend(value: str | None) -> str:
 
 def classify_fallback(error: object) -> str:
     message = str(error).lower()
-    if "not found" in message or "no such file" in message:
+    if "not found" in message or "no such file" in message or "not enabled in this build" in message:
         return "dependency_missing"
     if "out of memory" in message or "oom" in message or "bad_alloc" in message:
         return "resource_exhausted"
@@ -506,11 +506,18 @@ ULTRA_MODEL = _configured_path(
     "~/.local/share/voxtype/models/parakeet-ultra-Q8_0.gguf",
 )
 ULTRA_BACKEND = os.environ.get("WITNESS_ULTRA_BACKEND") or RUNTIME_CONFIG.get("ultra_backend") or "vulkan"
-# "auto" tries the AMD GPU first, then CPU. A machine without the MIGraphX
-# provider sets "cpu" here so every run does not start with a failed attempt.
+ULTRA_GPU_BACKENDS = ("vulkan", "cuda")
+# "auto" tries the GPU first, then CPU. A machine without a GPU provider sets
+# "cpu" here so every run does not start with a failed attempt.
 DIARIZER = (os.environ.get("WITNESS_DIARIZER") or RUNTIME_CONFIG.get("diarizer") or "auto").lower()
 if DIARIZER not in {"auto", "gpu", "cpu"}:
     DIARIZER = "auto"
+# Which speakrs mode "gpu" means: MIGraphX (AMD), or CUDA (NVIDIA).
+DIARIZER_GPU = (
+    os.environ.get("WITNESS_DIARIZER_GPU") or RUNTIME_CONFIG.get("diarizer_gpu") or "migraphx"
+).lower()
+if DIARIZER_GPU not in {"migraphx", "cuda", "cuda-fast"}:
+    DIARIZER_GPU = "migraphx"
 # Result-bearing stops keep their partial text; a too-short window has none.
 ULTRA_CUT_SHORT = ("output truncated", "output repetition")
 ULTRA_EMPTY = ("input audio too short",)
@@ -567,6 +574,12 @@ MIGRAPHX_LIB_DIRS = [
     ),
     "/usr/lib64",
 ]
+# CUDA and cuDNN directories the system loader does not know (colon-separated).
+CUDA_LIB_DIRS = [
+    os.path.expanduser(path)
+    for path in (os.environ.get("WITNESS_CUDA_LIB_DIR") or RUNTIME_CONFIG.get("cuda_lib_dir") or "").split(":")
+    if path
+]
 DEFAULT_MIGRAPHX_CACHE = (
     "~/.cache/migraphx-compiled-f44"
     if "/fedora44-witness/" in ORT_LIB
@@ -583,7 +596,7 @@ def runtime_env() -> dict[str, str]:
     env = os.environ.copy()
     env["ORT_DYLIB_PATH"] = ORT_LIB
     existing = env.get("LD_LIBRARY_PATH", "")
-    dirs = [path for path in MIGRAPHX_LIB_DIRS if os.path.isdir(path)]
+    dirs = [path for path in MIGRAPHX_LIB_DIRS + CUDA_LIB_DIRS if os.path.isdir(path)]
     env["LD_LIBRARY_PATH"] = ":".join(dirs + ([existing] if existing else []))
     env["ORT_MIGRAPHX_MODEL_CACHE_PATH"] = MIGRAPHX_CACHE_DIR
     return env
@@ -812,21 +825,29 @@ def _run_diarizer_once(wav_path: str, mode: str) -> tuple[list[dict], str, float
     os.makedirs(MIGRAPHX_CACHE_DIR, exist_ok=True)
     began = time.monotonic()
     proc = subprocess.run(
-        [SPEAKRS_CLI, f"--{mode}", wav_path],
+        # In speakrs-cli "--gpu" is MIGraphX; the CUDA modes go by name.
+        [SPEAKRS_CLI, f"--{mode}", wav_path] if mode == "cpu" or DIARIZER_GPU == "migraphx"
+        else [SPEAKRS_CLI, "--mode", DIARIZER_GPU, wav_path],
         capture_output=True,
         text=True,
         env=runtime_env(),
     )
     elapsed = time.monotonic() - began
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()
-        raise RuntimeError(detail or f"speakrs exited {proc.returncode}")
+        raise RuntimeError(_diarizer_error_detail(proc) or f"speakrs exited {proc.returncode}")
     parsed = _parse_diarizer_output(proc)
     if parsed is not None:
         segments, reported_mode = parsed
         return segments, reported_mode, elapsed
-    detail = (proc.stderr or proc.stdout).strip()
-    raise RuntimeError(detail or f"speakrs exited {proc.returncode} without speaker segments")
+    raise RuntimeError(
+        _diarizer_error_detail(proc) or f"speakrs exited {proc.returncode} without speaker segments"
+    )
+
+
+def _diarizer_error_detail(proc: subprocess.CompletedProcess) -> str:
+    """speakrs-cli names its mode on stderr before anything else; that is not the error."""
+    lines = (proc.stderr or proc.stdout).strip().splitlines()
+    return "\n".join(line for line in lines if not re.fullmatch(r"Using \S+ mode", line.strip())).strip()
 
 
 def run_diarizer(wav_path: str, requested: str) -> tuple[list[dict], str, float, str | None]:
@@ -1072,7 +1093,15 @@ def _ultra_batch(
     list_path = os.path.join(temp_dir, f"ultra-{backend}.list")
     Path(list_path).write_text("".join(job["path"] + "\n" for job in jobs), encoding="utf-8")
     env = os.environ.copy()
-    env.pop("LD_LIBRARY_PATH", None)  # the runtime's RUNPATH owns its ggml libraries
+    if ULTRA_BACKEND == "cuda" or CUDA_LIB_DIRS:
+        # A CUDA build loads the CUDA runtime from the system, on some machines
+        # only through this path, and it needs it for the CPU retry too.
+        dirs = [path for path in CUDA_LIB_DIRS if os.path.isdir(path)]
+        existing = env.pop("LD_LIBRARY_PATH", "")
+        if dirs or existing:
+            env["LD_LIBRARY_PATH"] = ":".join(dirs + ([existing] if existing else []))
+    else:
+        env.pop("LD_LIBRARY_PATH", None)  # the runtime's RUNPATH owns its ggml libraries
     proc = subprocess.run(
         [ULTRA_CLI, "-m", ULTRA_MODEL, "--backend", backend, "--threads", str(threads),
          "-q", "--batch", list_path, "--batch-jsonl"],
@@ -1095,15 +1124,15 @@ def run_ultra(
 ) -> tuple[dict[int, dict], float, str]:
     """Transcribe every window with Parakeet Ultra, retrying failed windows on CPU.
 
-    The TDT decoder runs on CPU threads even on Vulkan; ``threads`` pins that
+    The TDT decoder runs on CPU threads even on a GPU; ``threads`` pins that
     pool because the runtime default of eight stalls under desktop load.
     """
     if not os.path.isfile(ULTRA_CLI):
         raise RuntimeError(f"Parakeet Ultra runtime not found at {ULTRA_CLI}")
     if not os.path.isfile(ULTRA_MODEL):
         raise RuntimeError(f"Parakeet Ultra model not found at {ULTRA_MODEL}")
-    if ULTRA_BACKEND not in {"vulkan", "cpu"}:
-        raise RuntimeError("invalid Parakeet Ultra backend; use vulkan or cpu")
+    if ULTRA_BACKEND not in {*ULTRA_GPU_BACKENDS, "cpu"}:
+        raise RuntimeError("invalid Parakeet Ultra backend; use vulkan, cuda, or cpu")
 
     began = time.monotonic()
     results: dict[int, dict] = {}
@@ -1111,9 +1140,9 @@ def run_ultra(
     failures: list[str] = []
     cut_short = 0
     pending = list(jobs)
-    for backend in (["vulkan", "cpu"] if ULTRA_BACKEND == "vulkan" else ["cpu"]):
+    for backend in ([ULTRA_BACKEND, "cpu"] if ULTRA_BACKEND in ULTRA_GPU_BACKENDS else ["cpu"]):
         found, stderr, returncode = _ultra_batch(pending, backend, threads, temp_dir)
-        label = "vulkan" if backend == "vulkan" else "gguf-cpu"
+        label = backend if backend in ULTRA_GPU_BACKENDS else "gguf-cpu"
         failed: list[dict] = []
         for job in pending:
             item = found.get(job["id"])
@@ -1134,10 +1163,11 @@ def run_ultra(
         pending = failed
         if not pending:
             break
-        if backend == "vulkan":
-            notes.append(f"Vulkan failed on {len(pending)} window(s); CPU recovery used")
+        if backend in ULTRA_GPU_BACKENDS:
+            name = backend.capitalize() if backend == "vulkan" else backend.upper()
+            notes.append(f"{name} failed on {len(pending)} window(s); CPU recovery used")
             print(
-                f"Warning: Parakeet Ultra Vulkan failed on {len(pending)} window(s); retrying on CPU.",
+                f"Warning: Parakeet Ultra {name} failed on {len(pending)} window(s); retrying on CPU.",
                 file=sys.stderr,
             )
     elapsed = time.monotonic() - began
@@ -1335,7 +1365,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "gpu", "cpu"],
         default=DIARIZER,
         help="speakrs backend (default: auto, GPU with automatic CPU fallback, "
-             "or WITNESS_DIARIZER / runtime config 'diarizer')",
+             "or WITNESS_DIARIZER / runtime config 'diarizer'). The GPU mode is MIGraphX "
+             "unless WITNESS_DIARIZER_GPU / runtime config 'diarizer_gpu' says cuda or cuda-fast",
     )
     parser.add_argument("--gpu", action="store_true", help="Alias for --diarizer gpu")
     parser.add_argument("--format", choices=["markdown", "json", "srt"])
@@ -1518,7 +1549,7 @@ def _run_pipeline(args: argparse.Namespace, ledger: RunLedger) -> int:
         if not segments:
             raise SystemExit("Error: Parakeet Ultra returned no transcript text")
         backends = {item.get("backend") for item in results.values()}
-        if not backends <= {"vulkan", "gguf-cpu"}:
+        if not backends <= {*ULTRA_GPU_BACKENDS, "gguf-cpu"}:
             raise RuntimeError("unrecognized Parakeet Ultra backend metadata")
         transcription_backend = next(iter(backends)) if len(backends) == 1 else "mixed"
         transcription_engine = "Parakeet Ultra GGUF"

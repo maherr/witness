@@ -24,13 +24,18 @@ commit, builds it on your machine, and downloads the models.
 - **License**: Apache-2.0
 - **Copyright**: Praveen Perera
 - **Source**: https://github.com/avencera/speakrs
-- **Usage**: speaker diarization pipeline (segmentation, embedding, clustering). `install.sh` builds the command-line tool from https://github.com/maherr/speakrs, a fork that adds a MIGraphX execution mode
+- **Usage**: speaker diarization pipeline (segmentation, embedding, clustering). `install.sh` builds the command-line tool from https://github.com/maherr/speakrs, a fork that adds a MIGraphX execution mode and exposes the library's CUDA modes
 
 ### ONNX Runtime
 - **License**: MIT
 - **Copyright**: Microsoft Corporation
 - **Source**: https://github.com/microsoft/onnxruntime
-- **Usage**: inference runtime for speakrs. `install.sh` downloads Microsoft's unmodified 1.24.2 Linux x64 release archive, pinned by size and SHA-256
+- **Usage**: inference runtime for speakrs. `install.sh` downloads Microsoft's unmodified 1.24.2 Linux x64 release archive, pinned by size and SHA-256: the CPU build, or the GPU build for CUDA 12 or 13 on an NVIDIA machine
+
+### NVIDIA CUDA and cuDNN
+- **License**: NVIDIA's own license agreements (proprietary)
+- **Source**: https://developer.nvidia.com/cuda-toolkit and https://developer.nvidia.com/cudnn
+- **Usage**: optional, on NVIDIA machines only. Witness uses the copies already installed on your system; `install.sh` does not download or redistribute them
 
 ### FFmpeg
 - **License**: LGPL-2.1-or-later or GPL-2.0-or-later, depending on the distribution's build

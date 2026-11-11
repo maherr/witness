@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import stat
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -20,7 +21,7 @@ LOADER.exec_module(WITNESS)
 
 class WitnessUnitTests(unittest.TestCase):
     def test_transcription_backend_metadata_is_an_allowlisted_enum(self):
-        for backend in ("vulkan", "gguf-cpu", "mixed"):
+        for backend in ("vulkan", "cuda", "gguf-cpu", "mixed"):
             safe = WITNESS.sanitize_ledger_record({"transcription_backend": backend})
             self.assertEqual(safe["transcription_backend"], backend)
         safe = WITNESS.sanitize_ledger_record({"transcription_backend": "/private/transcript words"})
@@ -31,7 +32,8 @@ class WitnessUnitTests(unittest.TestCase):
         model = pathlib.Path(tmp) / "ultra.gguf"
         cli.write_text("fixture")
         model.write_text("fixture")
-        return mock.patch.multiple(WITNESS, ULTRA_CLI=str(cli), ULTRA_MODEL=str(model), ULTRA_BACKEND="vulkan")
+        return mock.patch.multiple(WITNESS, ULTRA_CLI=str(cli), ULTRA_MODEL=str(model), ULTRA_BACKEND="vulkan",
+                                   CUDA_LIB_DIRS=[])
 
     @staticmethod
     def _ultra_stdout(*items):
@@ -282,7 +284,9 @@ class WitnessUnitTests(unittest.TestCase):
             self.assertLessEqual(previous[1] - current[0], 5.001)
 
     def test_auto_diarizer_retries_cpu(self):
-        with mock.patch.object(
+        # Any existing file stands in for speakrs-cli, so the test also passes
+        # on a machine where Witness is not installed.
+        with mock.patch.object(WITNESS, "SPEAKRS_CLI", sys.executable), mock.patch.object(
             WITNESS,
             "_run_diarizer_once",
             side_effect=[
@@ -298,6 +302,63 @@ class WitnessUnitTests(unittest.TestCase):
         self.assertLess(elapsed, 0.6)
         self.assertEqual(first_error, "GPU init failed")
         self.assertEqual(WITNESS.classify_fallback(first_error), "initialization_failed")
+
+    def test_gpu_diarizer_command_follows_the_configured_gpu_mode(self):
+        payload = json.dumps({"segments": [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}],
+                              "execution_mode": "cuda"})
+        with tempfile.TemporaryDirectory() as tmp:
+            for gpu_mode, mode, expected in (
+                ("migraphx", "gpu", ["--gpu"]),
+                ("cuda", "gpu", ["--mode", "cuda"]),
+                ("cuda-fast", "gpu", ["--mode", "cuda-fast"]),
+                ("cuda", "cpu", ["--cpu"]),
+            ):
+                with self.subTest(gpu_mode=gpu_mode, mode=mode), \
+                     mock.patch.multiple(WITNESS, DIARIZER_GPU=gpu_mode, SPEAKRS_CLI="/fixture/speakrs-cli",
+                                         MIGRAPHX_CACHE_DIR=tmp, CUDA_LIB_DIRS=[tmp]), \
+                     mock.patch.object(WITNESS.subprocess, "run") as run:
+                    run.return_value = mock.Mock(returncode=0, stdout=payload, stderr="")
+                    _, reported, _ = WITNESS._run_diarizer_once("/a.wav", mode)
+                    self.assertEqual(run.call_args.args[0], ["/fixture/speakrs-cli", *expected, "/a.wav"])
+                    self.assertIn(tmp, run.call_args.kwargs["env"]["LD_LIBRARY_PATH"].split(":"))
+                    self.assertEqual(reported, "cuda")
+            with mock.patch.multiple(WITNESS, DIARIZER_GPU="cuda", SPEAKRS_CLI="/fixture/speakrs-cli",
+                                     MIGRAPHX_CACHE_DIR=tmp), \
+                 mock.patch.object(WITNESS.subprocess, "run") as run:
+                run.return_value = mock.Mock(
+                    returncode=1, stdout="", stderr="Using cuda mode\nError initializing pipeline: no CUDA device\n")
+                with self.assertRaisesRegex(RuntimeError, "^Error initializing pipeline: no CUDA device$"):
+                    WITNESS._run_diarizer_once("/a.wav", "gpu")
+        self.assertEqual(WITNESS.normalize_diarizer_backend("cuda"), "gpu")
+        self.assertEqual(WITNESS.normalize_diarizer_backend("cuda-fast"), "gpu")
+        self.assertEqual(
+            WITNESS.classify_fallback("Error initializing pipeline: CUDA execution provider is not enabled in this build."),
+            "dependency_missing",
+        )
+
+    def test_ultra_cuda_backend_is_recorded_and_retries_on_cpu(self):
+        with tempfile.TemporaryDirectory() as tmp, self._ultra_fixture(tmp), \
+             mock.patch.object(WITNESS, "ULTRA_BACKEND", "cuda"), \
+             mock.patch.object(WITNESS, "CUDA_LIB_DIRS", [tmp]), \
+             mock.patch.dict(WITNESS.os.environ, {"LD_LIBRARY_PATH": "/driver/lib"}), \
+             mock.patch.object(WITNESS.subprocess, "run") as run:
+            jobs = [{"id": 0, "path": f"{tmp}/window-00000.wav"}, {"id": 1, "path": f"{tmp}/window-00001.wav"}]
+            run.side_effect = [
+                mock.Mock(returncode=0, stderr="", stdout=self._ultra_stdout(
+                    {"file": jobs[0]["path"], "text": "Hello."},
+                    {"file": jobs[1]["path"], "text": "", "error": "backend error"})),
+                mock.Mock(returncode=0, stderr="", stdout=self._ultra_stdout({"file": jobs[1]["path"], "text": "Again."})),
+            ]
+            results, _, notes = WITNESS.run_ultra(jobs, 4, tmp)
+            first, retry = (call.args[0] for call in run.call_args_list)
+            self.assertEqual(first[first.index("--backend") + 1], "cuda")
+            self.assertEqual(retry[retry.index("--backend") + 1], "cpu")
+            for call in run.call_args_list:
+                self.assertEqual(call.kwargs["env"]["LD_LIBRARY_PATH"], f"{tmp}:/driver/lib")
+        self.assertEqual(results[0], {"text": "Hello.", "backend": "cuda"})
+        self.assertEqual(results[1], {"text": "Again.", "backend": "gguf-cpu"})
+        self.assertIn("CUDA failed on 1 window(s)", notes)
+        self.assertEqual(WITNESS.sanitize_ledger_record({"transcription_backend": "cuda"})["transcription_backend"], "cuda")
 
     def test_srt_contains_speaker_and_monotonic_times(self):
         text = WITNESS.srt_output(
