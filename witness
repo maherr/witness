@@ -1,0 +1,1601 @@
+#!/usr/bin/env python3
+"""Witness: local file transcription with optional speaker diarization.
+
+Every surfaced word comes from one transcription engine, Parakeet Ultra.
+Witness supplies the structure around it (language label, speech windows,
+speaker turns):
+
+1. Convert input to 16 kHz mono WAV.
+2. For ``--language auto``, use Whisper only as an EN/FR language classifier
+   for the label in the output; Parakeet Ultra detects language itself.
+3. Run speakrs first when diarization is enabled (GPU, then CPU fallback).
+4. Split speaker turns into windows of up to 35 seconds with 5 second overlap.
+5. Send every window to one Parakeet Ultra process that loads its model once.
+6. Remove exact overlap duplicates and emit Markdown, JSON, or SRT.
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import difflib
+import json
+import math
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import uuid
+import wave
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SAMPLE_RATE = 16_000
+MAX_WINDOW_SECONDS = 35.0
+DEFAULT_OVERLAP_SECONDS = 5.0
+LEDGER_ENGINE = "parakeet-ultra"
+MIN_AUDIO_SECONDS = 0.12
+
+LEDGER_SCHEMA_VERSION = 3
+LEDGER_FIELDS = (
+    "schema_version",
+    "run_id",
+    "timestamp",
+    "status",
+    "stage",
+    "requested_language",
+    "resolved_language",
+    "language_confidence",
+    "language_probes",
+    "language_votes",
+    "diarization_enabled",
+    "requested_diarizer",
+    "resolved_diarizer",
+    "fallback_class",
+    "duration_secs",
+    "speakers_detected",
+    "unknown_speech_secs",
+    "windows",
+    "segments",
+    "output_format",
+    "conversion_secs",
+    "language_detection_secs",
+    "vad_secs",
+    "diarization_secs",
+    "windowing_secs",
+    "transcription_engine",
+    "transcription_backend",
+    "transcription_secs",
+    "output_secs",
+    "pipeline_secs",
+    "failure_class",
+)
+LEDGER_ENUMS = {
+    "transcription_engine": {LEDGER_ENGINE},
+    "transcription_backend": {"vulkan", "gguf-cpu", "mixed"},
+    "status": {"started", "completed", "failed"},
+    "stage": {
+        "validation",
+        "conversion",
+        "language_detection",
+        "vad",
+        "diarization",
+        "windowing",
+        "transcription",
+        "output",
+        "completed",
+        "internal",
+    },
+    "requested_language": {"auto", "en", "fr"},
+    "resolved_language": {"en", "fr"},
+    "requested_diarizer": {"auto", "gpu", "cpu", "disabled"},
+    "resolved_diarizer": {"gpu", "cpu", "disabled", "unknown"},
+    "fallback_class": {
+        "none",
+        "dependency_missing",
+        "initialization_failed",
+        "resource_exhausted",
+        "no_segments",
+        "process_failed",
+        "other",
+    },
+    "output_format": {"markdown", "json", "srt", "unknown"},
+    "failure_class": {
+        "invalid_arguments",
+        "input_missing",
+        "input_too_short",
+        "conversion_failed",
+        "language_detection_failed",
+        "unsupported_language",
+        "vad_failed",
+        "no_speech",
+        "diarizer_unavailable",
+        "diarizer_initialization_failed",
+        "diarization_failed",
+        "no_speaker_turns",
+        "no_windows",
+        "windowing_failed",
+        "ultra_unavailable",
+        "transcription_failed",
+        "no_transcript",
+        "output_failed",
+        "interrupted",
+        "internal_error",
+    },
+}
+LEDGER_FLOAT_FIELDS = {
+    "language_confidence",
+    "duration_secs",
+    "unknown_speech_secs",
+    "conversion_secs",
+    "language_detection_secs",
+    "vad_secs",
+    "diarization_secs",
+    "windowing_secs",
+    "transcription_secs",
+    "output_secs",
+    "pipeline_secs",
+}
+LEDGER_INT_FIELDS = {
+    "language_probes",
+    "language_votes",
+    "speakers_detected",
+    "windows",
+    "segments",
+}
+
+
+def _env_path(var: str, default: str) -> str:
+    return os.path.expanduser(os.environ.get(var, default))
+
+
+RUNTIME_CONFIG_PATH = _env_path(
+    "WITNESS_RUNTIME_CONFIG",
+    "~/.config/witness/runtime.json",
+)
+RUN_LOG_PATH = _env_path(
+    "WITNESS_RUN_LOG",
+    "~/.local/state/witness/runs.jsonl",
+)
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _valid_iso_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def _safe_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def sanitize_ledger_record(record: dict) -> dict:
+    """Return the fixed privacy-safe ledger schema.
+
+    No caller-provided free-form string is serialized. Paths, filenames,
+    transcript text, helper logs, and raw errors are structurally excluded.
+    """
+    safe: dict[str, object] = {"schema_version": LEDGER_SCHEMA_VERSION}
+    run_id = record.get("run_id")
+    safe["run_id"] = (
+        run_id
+        if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id)
+        else uuid.uuid4().hex
+    )
+    timestamp = record.get("timestamp")
+    safe["timestamp"] = timestamp if _valid_iso_timestamp(timestamp) else _iso_now()
+
+    for field, allowed in LEDGER_ENUMS.items():
+        value = record.get(field)
+        if isinstance(value, str) and value in allowed:
+            safe[field] = value
+        elif field == "status":
+            safe[field] = "failed"
+        elif field == "stage":
+            safe[field] = "internal"
+        elif field == "fallback_class":
+            safe[field] = "other"
+        elif field == "output_format":
+            safe[field] = "unknown"
+        elif field == "failure_class" and value is not None:
+            safe[field] = "internal_error"
+        else:
+            safe[field] = None
+
+    safe["diarization_enabled"] = (
+        record.get("diarization_enabled")
+        if isinstance(record.get("diarization_enabled"), bool)
+        else None
+    )
+    for field in LEDGER_FLOAT_FIELDS:
+        safe[field] = _safe_float(record.get(field))
+    for field in LEDGER_INT_FIELDS:
+        safe[field] = _safe_int(record.get(field))
+    return {field: safe.get(field) for field in LEDGER_FIELDS}
+
+
+def _open_safe_parent(path: Path) -> tuple[int, str]:
+    """Open an absolute path's parent without following any symlink component."""
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.parts
+    if len(parts) < 2 or not absolute.is_absolute():
+        raise OSError("ledger path must name a file")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(os.path.sep, directory_flags)
+    try:
+        for component in parts[1:-1]:
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd, parts[-1]
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def append_ledger_record(record: dict) -> bool:
+    """Append one mode-600 JSON record; ordinary I/O failure is non-fatal."""
+    directory_fd: int | None = None
+    fd: int | None = None
+    try:
+        directory_fd, filename = _open_safe_parent(Path(RUN_LOG_PATH))
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(filename, flags, 0o600, dir_fd=directory_fd)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            return False
+        os.fchmod(fd, 0o600)
+        payload = (
+            json.dumps(sanitize_ledger_record(record), sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        written = os.write(fd, payload)
+        return written == len(payload)
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+def normalize_diarizer_backend(value: str | None) -> str:
+    normalized = (value or "").lower()
+    if normalized in {"gpu", "migraphx"}:
+        return "gpu"
+    if normalized == "cpu":
+        return "cpu"
+    if normalized == "disabled":
+        return "disabled"
+    return "unknown"
+
+
+def classify_fallback(error: object) -> str:
+    message = str(error).lower()
+    if "not found" in message or "no such file" in message:
+        return "dependency_missing"
+    if "out of memory" in message or "oom" in message or "bad_alloc" in message:
+        return "resource_exhausted"
+    if (
+        "same_dims" in message
+        or "initializ" in message
+        or "init failed" in message
+        or "failed to init" in message
+        or "failed to load" in message
+    ):
+        return "initialization_failed"
+    if "without speaker segments" in message or "no speaker" in message:
+        return "no_segments"
+    if "exited" in message or "signal" in message or "abort" in message:
+        return "process_failed"
+    return "other"
+
+
+def classify_failure(error: BaseException, stage: str) -> str:
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted"
+    message = str(error).lower()
+    if "file not found" in message:
+        return "input_missing"
+    if "too short" in message:
+        return "input_too_short"
+    if "dominant auto-detected language is unsupported" in message:
+        return "unsupported_language"
+    if "found no speech regions" in message:
+        return "no_speech"
+    if "found no usable speech turns" in message:
+        return "no_speaker_turns"
+    if "no transcription jobs" in message:
+        return "no_windows"
+    if "returned no transcript text" in message:
+        return "no_transcript"
+    if stage == "validation":
+        return "invalid_arguments"
+    if stage == "conversion":
+        return "conversion_failed"
+    if stage == "language_detection":
+        return "language_detection_failed"
+    if stage == "vad":
+        return "vad_failed"
+    if stage == "diarization":
+        if "not found" in message:
+            return "diarizer_unavailable"
+        if classify_fallback(error) == "initialization_failed":
+            return "diarizer_initialization_failed"
+        return "diarization_failed"
+    if stage == "windowing":
+        return "windowing_failed"
+    if stage == "transcription":
+        if "not found" in message:
+            return "ultra_unavailable"
+        return "transcription_failed"
+    if stage == "output":
+        return "output_failed"
+    return "internal_error"
+
+
+class RunLedger:
+    """Best-effort privacy-safe operational metrics for one CLI invocation."""
+
+    def __init__(
+        self,
+        requested_language: str,
+        diarization_enabled: bool,
+        requested_diarizer: str,
+        output_format: str,
+        transcription_engine: str | None = None,
+    ) -> None:
+        self.started_monotonic = time.monotonic()
+        self.terminal_written = False
+        self.state: dict[str, object] = {
+            "run_id": uuid.uuid4().hex,
+            "status": "started",
+            "stage": "validation",
+            "requested_language": requested_language,
+            "resolved_language": None,
+            "language_confidence": None,
+            "diarization_enabled": diarization_enabled,
+            "requested_diarizer": requested_diarizer,
+            "resolved_diarizer": "disabled" if not diarization_enabled else None,
+            "fallback_class": "none",
+            "duration_secs": None,
+            "speakers_detected": None,
+            "unknown_speech_secs": None,
+            "windows": None,
+            "segments": None,
+            "output_format": output_format,
+            "conversion_secs": None,
+            "language_detection_secs": None,
+            "vad_secs": None,
+            "diarization_secs": None,
+            "windowing_secs": None,
+            "transcription_engine": transcription_engine,
+            "transcription_secs": None,
+            "output_secs": None,
+            "pipeline_secs": None,
+            "failure_class": None,
+        }
+
+    @property
+    def stage(self) -> str:
+        return str(self.state["stage"])
+
+    def update(self, **values: object) -> None:
+        self.state.update(values)
+
+    def set_stage(self, stage: str) -> None:
+        self.state["stage"] = stage
+
+    def _write(self) -> bool:
+        return append_ledger_record({**self.state, "timestamp": _iso_now()})
+
+    def start(self) -> bool:
+        return self._write()
+
+    def complete(self) -> bool:
+        if self.terminal_written:
+            return False
+        self.update(
+            status="completed",
+            stage="completed",
+            pipeline_secs=time.monotonic() - self.started_monotonic,
+            failure_class=None,
+        )
+        written = self._write()
+        if written:
+            self.terminal_written = True
+        return written
+
+    def fail(self, error: BaseException) -> bool:
+        if self.terminal_written:
+            return False
+        stage = self.stage
+        self.update(
+            status="failed",
+            pipeline_secs=time.monotonic() - self.started_monotonic,
+            failure_class=classify_failure(error, stage),
+        )
+        if stage == "diarization" and self.state.get("requested_diarizer") == "auto":
+            self.state["fallback_class"] = classify_fallback(error)
+        written = self._write()
+        if written:
+            self.terminal_written = True
+        return written
+
+
+def _load_runtime_config() -> dict[str, str]:
+    try:
+        raw = json.loads(Path(RUNTIME_CONFIG_PATH).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, TypeError) as error:
+        print(f"Warning: ignoring invalid Witness runtime config: {error}", file=sys.stderr)
+        return {}
+    return {str(key): str(value) for key, value in raw.items() if value}
+
+
+RUNTIME_CONFIG = _load_runtime_config()
+
+
+def _configured_path(var: str, key: str, default: str) -> str:
+    return os.path.expanduser(os.environ.get(var) or RUNTIME_CONFIG.get(key) or default)
+
+
+def _first_existing(var: str, defaults: list[str], config_key: str | None = None) -> str:
+    override = os.environ.get(var) or (RUNTIME_CONFIG.get(config_key) if config_key else None)
+    if override:
+        return os.path.expanduser(override)
+    expanded = [os.path.expanduser(path) for path in defaults]
+    return next((path for path in expanded if os.path.exists(path)), expanded[0])
+
+
+ULTRA_CLI = _configured_path(
+    "WITNESS_ULTRA_CLI", "ultra_cli",
+    "~/.local/share/transcribe-vulkan/5d66f602/bin/transcribe-cli",
+)
+ULTRA_MODEL = _configured_path(
+    "WITNESS_ULTRA_MODEL", "ultra_model",
+    "~/.local/share/voxtype/models/parakeet-ultra-Q8_0.gguf",
+)
+ULTRA_BACKEND = os.environ.get("WITNESS_ULTRA_BACKEND") or RUNTIME_CONFIG.get("ultra_backend") or "vulkan"
+# "auto" tries the AMD GPU first, then CPU. A machine without the MIGraphX
+# provider sets "cpu" here so every run does not start with a failed attempt.
+DIARIZER = (os.environ.get("WITNESS_DIARIZER") or RUNTIME_CONFIG.get("diarizer") or "auto").lower()
+if DIARIZER not in {"auto", "gpu", "cpu"}:
+    DIARIZER = "auto"
+# Result-bearing stops keep their partial text; a too-short window has none.
+ULTRA_CUT_SHORT = ("output truncated", "output repetition")
+ULTRA_EMPTY = ("input audio too short",)
+
+WHISPER_CLI = _configured_path(
+    "WITNESS_WHISPER_CLI",
+    "whisper_cli",
+    "~/.local/share/whisper-cpp/src/build/bin/whisper-cli",
+)
+VAD_CLI = _configured_path(
+    "WITNESS_VAD_CLI",
+    "vad_cli",
+    "~/.local/share/whisper-cpp/src/build/bin/whisper-vad-speech-segments",
+)
+VAD_MODEL = _configured_path(
+    "WITNESS_VAD_MODEL",
+    "vad_model",
+    "~/.local/share/voxtype/models/ggml-silero-v6.2.0.bin",
+)
+LANGUAGE_MODEL = _first_existing(
+    "WITNESS_LANGUAGE_MODEL",
+    [
+        "~/.local/share/voxtype/models/ggml-base.bin",
+        "~/.local/share/voxtype/models/ggml-large-v3-turbo.bin",
+        "~/.local/share/voxtype/models/ggml-large-v3.bin",
+    ],
+    "language_model",
+)
+SPEAKRS_CLI = _configured_path(
+    "WITNESS_SPEAKRS_CLI",
+    "speakrs_cli",
+    "~/.local/bin/speakrs-cli",
+)
+
+ORT_LIB = _first_existing(
+    "WITNESS_ORT_LIB",
+    [
+        "~/.local/share/fedora44-witness/ort-rocm-install/lib/libonnxruntime.so.1.24.2",
+        "~/.local/share/gpu-diarization-build/ort-rocm-install/lib/libonnxruntime.so.1.24.2",
+    ],
+    "ort_lib",
+)
+ORT_LIB_DIR = os.path.dirname(ORT_LIB)
+MIGRAPHX_LIB_DIRS = [
+    ORT_LIB_DIR,
+    _configured_path(
+        "WITNESS_MIGRAPHX_LIB_DIR",
+        "migraphx_lib_dir",
+        "~/.local/share/gpu-diarization-build/migraphx-install/lib",
+    ),
+    _env_path(
+        "WITNESS_MIGRAPHX_EXTRA_LIB_DIR",
+        "~/.local/share/gpu-diarization-build/migraphx-install/lib/migraphx/lib",
+    ),
+    "/usr/lib64",
+]
+DEFAULT_MIGRAPHX_CACHE = (
+    "~/.cache/migraphx-compiled-f44"
+    if "/fedora44-witness/" in ORT_LIB
+    else "~/.cache/migraphx-compiled"
+)
+MIGRAPHX_CACHE_DIR = _configured_path(
+    "ORT_MIGRAPHX_MODEL_CACHE_PATH",
+    "migraphx_cache_dir",
+    DEFAULT_MIGRAPHX_CACHE,
+)
+
+
+def runtime_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["ORT_DYLIB_PATH"] = ORT_LIB
+    existing = env.get("LD_LIBRARY_PATH", "")
+    dirs = [path for path in MIGRAPHX_LIB_DIRS if os.path.isdir(path)]
+    env["LD_LIBRARY_PATH"] = ":".join(dirs + ([existing] if existing else []))
+    env["ORT_MIGRAPHX_MODEL_CACHE_PATH"] = MIGRAPHX_CACHE_DIR
+    return env
+
+
+def convert_to_wav(input_path: str, output_path: str) -> None:
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            input_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "1",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed: {proc.stderr.strip()}")
+
+
+def read_pcm_wav(wav_path: str) -> array.array:
+    with wave.open(wav_path, "rb") as reader:
+        if (
+            reader.getframerate() != SAMPLE_RATE
+            or reader.getnchannels() != 1
+            or reader.getsampwidth() != 2
+        ):
+            raise RuntimeError("internal WAV must be 16 kHz mono s16le")
+        samples = array.array("h", reader.readframes(reader.getnframes()))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples
+
+
+def write_pcm_slice(samples: array.array, start: float, end: float, path: str) -> None:
+    first = max(0, min(len(samples), int(math.floor(start * SAMPLE_RATE))))
+    last = max(first, min(len(samples), int(math.ceil(end * SAMPLE_RATE))))
+    chunk = samples[first:last]
+    if sys.byteorder != "little":
+        chunk = array.array("h", chunk)
+        chunk.byteswap()
+    with wave.open(path, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(SAMPLE_RATE)
+        writer.writeframes(chunk.tobytes())
+
+
+def duration_seconds(samples: array.array) -> float:
+    return len(samples) / SAMPLE_RATE
+
+
+def format_timestamp(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    millis = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(millis, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, ms = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def _highest_energy_window(
+    samples: array.array,
+    seconds: float = 30.0,
+    region_start: float = 0.0,
+    region_end: float | None = None,
+) -> tuple[float, float]:
+    if not samples:
+        raise RuntimeError("audio is empty")
+    audio_duration = len(samples) / SAMPLE_RATE
+    region_start = max(0.0, min(audio_duration, region_start))
+    region_end = max(region_start, min(audio_duration, region_end or audio_duration))
+    first = int(region_start * SAMPLE_RATE)
+    last = int(region_end * SAMPLE_RATE)
+    region = samples[first:last]
+    window_samples = min(len(region), max(1, int(seconds * SAMPLE_RATE)))
+    if len(region) <= window_samples:
+        return region_start, region_end
+
+    block = SAMPLE_RATE
+    energies = [
+        sum(abs(value) for value in region[offset : offset + block])
+        for offset in range(0, len(region), block)
+    ]
+    width = max(1, int(math.ceil(window_samples / block)))
+    current = sum(energies[:width])
+    best_energy = current
+    best_index = 0
+    for index in range(width, len(energies)):
+        current += energies[index] - energies[index - width]
+        if current > best_energy:
+            best_energy = current
+            best_index = index - width + 1
+    start = region_start + best_index * 1.0
+    start = min(start, region_end - seconds)
+    return max(region_start, start), min(region_end, start + seconds)
+
+
+def choose_detected_language(
+    detections: list[tuple[str, float]],
+) -> tuple[str, float, int, int]:
+    if not detections:
+        raise RuntimeError("language detection produced no probes")
+    languages = {language for language, _ in detections}
+    scores = {
+        language: sum(confidence for found, confidence in detections if found == language)
+        for language in languages
+    }
+    counts = {
+        language: sum(1 for found, _ in detections if found == language)
+        for language in languages
+    }
+    language = max(languages, key=lambda item: (counts[item], scores[item]))
+    if language not in {"en", "fr"}:
+        found = ", ".join(f"{found} p={confidence:.3f}" for found, confidence in detections)
+        raise RuntimeError(
+            f"dominant auto-detected language is unsupported ({found}); "
+            "Witness supports English or French"
+        )
+    winning_confidences = [confidence for found, confidence in detections if found == language]
+    confidence = sum(winning_confidences) / len(winning_confidences)
+    return language, confidence, len(detections), counts[language]
+
+
+def detect_language(
+    samples: array.array,
+    temp_dir: str,
+) -> tuple[str, float, float, int, int]:
+    if not os.path.isfile(WHISPER_CLI):
+        raise RuntimeError(
+            f"Whisper language detector not found at {WHISPER_CLI}; pass --language en or fr"
+        )
+    if not os.path.isfile(LANGUAGE_MODEL):
+        raise RuntimeError(
+            f"Whisper language model not found at {LANGUAGE_MODEL}; pass --language en or fr"
+        )
+
+    audio_duration = duration_seconds(samples)
+    regions = [(0.0, audio_duration)]
+    if audio_duration > 45.0:
+        region_width = audio_duration / 3.0
+        regions = [
+            (index * region_width, (index + 1) * region_width)
+            for index in range(3)
+        ]
+
+    began = time.monotonic()
+    detections: list[tuple[str, float]] = []
+    for index, (region_start, region_end) in enumerate(regions):
+        start, end = _highest_energy_window(
+            samples,
+            min(30.0, region_end - region_start),
+            region_start,
+            region_end,
+        )
+        clip = os.path.join(temp_dir, f"language-detect-{index}.wav")
+        write_pcm_slice(samples, start, end, clip)
+        proc = subprocess.run(
+            [
+                WHISPER_CLI,
+                "-m",
+                LANGUAGE_MODEL,
+                "-f",
+                clip,
+                "-l",
+                "auto",
+                "--detect-language",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        match = re.search(
+            r"auto-detected language:\s*([a-z]{2,3})\s*\(p\s*=\s*([0-9.]+)\)",
+            combined,
+        )
+        if proc.returncode != 0 or not match:
+            tail = "\n".join(combined.strip().splitlines()[-8:])
+            raise RuntimeError(f"language detection failed on probe {index + 1}:\n{tail}")
+        detections.append((match.group(1), float(match.group(2))))
+
+    elapsed = time.monotonic() - began
+    language, confidence, probes, votes = choose_detected_language(detections)
+    return language, confidence, elapsed, probes, votes
+
+
+def _parse_diarizer_output(proc: subprocess.CompletedProcess[str]) -> tuple[list[dict], str] | None:
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    raw = data.get("segments")
+    if not isinstance(raw, list) or not raw:
+        return None
+    segments = [
+        {
+            "start": float(item["start"]),
+            "end": float(item["end"]),
+            "speaker": str(item["speaker"]),
+        }
+        for item in raw
+        if float(item["end"]) > float(item["start"])
+    ]
+    return (segments, str(data.get("execution_mode", "unknown"))) if segments else None
+
+
+def _run_diarizer_once(wav_path: str, mode: str) -> tuple[list[dict], str, float]:
+    os.makedirs(MIGRAPHX_CACHE_DIR, exist_ok=True)
+    began = time.monotonic()
+    proc = subprocess.run(
+        [SPEAKRS_CLI, f"--{mode}", wav_path],
+        capture_output=True,
+        text=True,
+        env=runtime_env(),
+    )
+    elapsed = time.monotonic() - began
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(detail or f"speakrs exited {proc.returncode}")
+    parsed = _parse_diarizer_output(proc)
+    if parsed is not None:
+        segments, reported_mode = parsed
+        return segments, reported_mode, elapsed
+    detail = (proc.stderr or proc.stdout).strip()
+    raise RuntimeError(detail or f"speakrs exited {proc.returncode} without speaker segments")
+
+
+def run_diarizer(wav_path: str, requested: str) -> tuple[list[dict], str, float, str | None]:
+    if not os.path.isfile(SPEAKRS_CLI):
+        raise RuntimeError(f"speakrs-cli not found at {SPEAKRS_CLI}")
+    attempts = [requested] if requested in {"gpu", "cpu"} else ["gpu", "cpu"]
+    first_error: str | None = None
+    total_elapsed = 0.0
+    for mode in attempts:
+        attempt_started = time.monotonic()
+        try:
+            segments, reported_mode, elapsed = _run_diarizer_once(wav_path, mode)
+            total_elapsed += elapsed
+            return segments, reported_mode, total_elapsed, first_error
+        except RuntimeError as error:
+            total_elapsed += time.monotonic() - attempt_started
+            if first_error is None:
+                first_error = str(error)
+            if mode == attempts[-1]:
+                raise RuntimeError(
+                    f"speakrs {mode} diarization failed: {error}"
+                    + (f"\nGPU failure was: {first_error}" if mode == "cpu" else "")
+                ) from error
+            headline = str(error).splitlines()[0] if str(error) else "unknown error"
+            print(
+                f"Warning: speakrs GPU failed ({headline}); retrying on CPU.",
+                file=sys.stderr,
+            )
+    raise AssertionError("unreachable")
+
+
+def run_vad(wav_path: str) -> tuple[list[dict], float]:
+    if not os.path.isfile(VAD_CLI):
+        raise RuntimeError(f"Silero VAD helper not found at {VAD_CLI}")
+    if not os.path.isfile(VAD_MODEL):
+        raise RuntimeError(f"Silero VAD model not found at {VAD_MODEL}")
+    began = time.monotonic()
+    proc = subprocess.run(
+        [VAD_CLI, "-vm", VAD_MODEL, "-f", wav_path, "-np"],
+        capture_output=True,
+        text=True,
+    )
+    elapsed = time.monotonic() - began
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(detail or f"Silero VAD exited {proc.returncode}")
+    spans = parse_vad_output(proc.stdout)
+    if not spans:
+        raise RuntimeError("Silero VAD found no speech regions")
+    return spans, elapsed
+
+
+def parse_vad_output(output: str) -> list[dict]:
+    matches = re.findall(
+        r"Speech segment \d+: start = ([0-9.]+), end = ([0-9.]+)",
+        output,
+    )
+    return [
+        {"start": float(start) / 100.0, "end": float(end) / 100.0, "speaker": None}
+        for start, end in matches
+        if float(end) > float(start)
+    ]
+
+
+def merge_speech_regions(regions: list[dict], max_gap: float = 2.0) -> list[dict]:
+    """Keep short pauses inside one ASR span so nearby context is preserved."""
+    merged: list[dict] = []
+    for region in sorted(regions, key=lambda item: (item["start"], item["end"])):
+        item = {
+            "start": float(region["start"]),
+            "end": float(region["end"]),
+            "speaker": region.get("speaker"),
+        }
+        if merged and item["start"] - merged[-1]["end"] <= max_gap:
+            merged[-1]["end"] = max(merged[-1]["end"], item["end"])
+        else:
+            merged.append(item)
+    return merged
+
+
+def merge_unknown_turns(turns: list[dict], max_gap: float = 2.0) -> list[dict]:
+    """Join nearby UNKNOWN speech without bridging labeled speaker turns."""
+    merged: list[dict] = []
+    for turn in sorted(turns, key=lambda item: (item["start"], item["end"])):
+        item = {
+            "start": float(turn["start"]),
+            "end": float(turn["end"]),
+            "speaker": turn.get("speaker"),
+        }
+        if (
+            merged
+            and merged[-1]["speaker"] == "UNKNOWN"
+            and item["speaker"] == "UNKNOWN"
+            and item["start"] - merged[-1]["end"] <= max_gap
+        ):
+            merged[-1]["end"] = max(merged[-1]["end"], item["end"])
+        else:
+            merged.append(item)
+    return merged
+
+
+def normalize_turns(raw: list[dict], audio_duration: float) -> list[dict]:
+    cleaned: list[dict] = []
+    for segment in sorted(raw, key=lambda item: (item["start"], item["end"])):
+        start = max(0.0, min(audio_duration, float(segment["start"])))
+        end = max(start, min(audio_duration, float(segment["end"])))
+        if end - start < MIN_AUDIO_SECONDS:
+            continue
+        item = {"start": start, "end": end, "speaker": str(segment["speaker"])}
+        if (
+            cleaned
+            and cleaned[-1]["speaker"] == item["speaker"]
+            and item["start"] - cleaned[-1]["end"] <= 0.5
+        ):
+            cleaned[-1]["end"] = max(cleaned[-1]["end"], item["end"])
+        else:
+            cleaned.append(item)
+    return cleaned
+
+
+def cover_timeline(
+    turns: list[dict],
+    speech_regions: list[dict],
+) -> list[dict]:
+    """Label Silero-speech spans missed by speakrs as UNKNOWN.
+
+    Short VAD pauses stay inside one UNKNOWN context span when speakrs misses
+    the surrounding speech completely, without bridging labeled turns.
+    """
+    ordered_turns = sorted(turns, key=lambda item: (item["start"], item["end"]))
+    unknown: list[dict] = []
+    for region in speech_regions:
+        start = float(region["start"])
+        end = float(region["end"])
+        cursor = start
+        for turn in ordered_turns:
+            if turn["end"] <= cursor:
+                continue
+            if turn["start"] >= end:
+                break
+            if turn["start"] - cursor >= MIN_AUDIO_SECONDS:
+                unknown.append(
+                    {"start": cursor, "end": min(end, turn["start"]), "speaker": "UNKNOWN"}
+                )
+            cursor = max(cursor, min(end, turn["end"]))
+            if cursor >= end:
+                break
+        if end - cursor >= MIN_AUDIO_SECONDS:
+            unknown.append({"start": cursor, "end": end, "speaker": "UNKNOWN"})
+    combined = sorted(ordered_turns + unknown, key=lambda item: (item["start"], item["end"]))
+    return merge_unknown_turns(combined)
+
+
+def _quiet_cut(samples: array.array, low: float, high: float) -> float:
+    low_index = max(0, int(low * SAMPLE_RATE))
+    high_index = min(len(samples), int(high * SAMPLE_RATE))
+    if high_index <= low_index:
+        return high
+    window = int(0.2 * SAMPLE_RATE)
+    step = int(0.05 * SAMPLE_RATE)
+    best_index = high_index
+    best_energy: float | None = None
+    for center in range(low_index + window // 2, high_index - window // 2 + 1, step):
+        chunk = samples[center - window // 2 : center + window // 2]
+        energy = sum(abs(value) for value in chunk) / max(1, len(chunk))
+        if best_energy is None or energy < best_energy:
+            best_energy = energy
+            best_index = center
+    return best_index / SAMPLE_RATE
+
+
+def split_span(
+    samples: array.array,
+    start: float,
+    end: float,
+    max_seconds: float,
+    overlap_seconds: float,
+) -> list[tuple[float, float]]:
+    if end - start <= max_seconds:
+        return [(start, end)] if end - start >= MIN_AUDIO_SECONDS else []
+
+    spans: list[tuple[float, float]] = []
+    cursor = start
+    while end - cursor > max_seconds:
+        search_low = cursor + max(5.0, max_seconds - 10.0)
+        search_high = min(end, cursor + max_seconds)
+        cut = _quiet_cut(samples, search_low, search_high)
+        if cut <= cursor + overlap_seconds + 1.0:
+            cut = min(end, cursor + max_seconds)
+        spans.append((cursor, cut))
+        next_cursor = cut - overlap_seconds
+        if next_cursor <= cursor + 0.5:
+            next_cursor = cut
+        cursor = next_cursor
+    if end - cursor >= MIN_AUDIO_SECONDS:
+        spans.append((cursor, end))
+    elif spans:
+        spans[-1] = (spans[-1][0], end)
+    return spans
+
+
+def build_jobs(
+    samples: array.array,
+    turns: list[dict],
+    diarized: bool,
+    max_seconds: float,
+    overlap_seconds: float,
+) -> list[dict]:
+    jobs: list[dict] = []
+    for turn_id, turn in enumerate(turns):
+        spans = split_span(
+            samples,
+            turn["start"],
+            turn["end"],
+            max_seconds,
+            overlap_seconds,
+        )
+        for chunk_id, (start, end) in enumerate(spans):
+            jobs.append(
+                {
+                    "id": len(jobs),
+                    "turn_id": turn_id,
+                    "chunk_id": chunk_id,
+                    "start": start,
+                    "end": end,
+                    "speaker": turn["speaker"] if diarized else None,
+                }
+            )
+    return jobs
+
+
+def materialize_jobs(samples: array.array, jobs: list[dict], temp_dir: str) -> None:
+    for job in jobs:
+        path = os.path.join(temp_dir, f"window-{job['id']:05d}.wav")
+        write_pcm_slice(samples, job["start"], job["end"], path)
+        job["path"] = path
+
+
+def _ultra_batch(
+    jobs: list[dict], backend: str, threads: int, temp_dir: str,
+) -> tuple[dict[int, dict], str, int]:
+    """Run one transcribe-cli batch and map its JSONL lines back to job ids."""
+    list_path = os.path.join(temp_dir, f"ultra-{backend}.list")
+    Path(list_path).write_text("".join(job["path"] + "\n" for job in jobs), encoding="utf-8")
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)  # the runtime's RUNPATH owns its ggml libraries
+    proc = subprocess.run(
+        [ULTRA_CLI, "-m", ULTRA_MODEL, "--backend", backend, "--threads", str(threads),
+         "-q", "--batch", list_path, "--batch-jsonl"],
+        capture_output=True, text=True, env=env,
+    )
+    by_path = {job["path"]: job["id"] for job in jobs}
+    found: dict[int, dict] = {}
+    for line in proc.stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("file") in by_path:
+            found[by_path[item["file"]]] = item
+    return found, proc.stderr.strip(), proc.returncode
+
+
+def run_ultra(
+    jobs: list[dict], threads: int, temp_dir: str,
+) -> tuple[dict[int, dict], float, str]:
+    """Transcribe every window with Parakeet Ultra, retrying failed windows on CPU.
+
+    The TDT decoder runs on CPU threads even on Vulkan; ``threads`` pins that
+    pool because the runtime default of eight stalls under desktop load.
+    """
+    if not os.path.isfile(ULTRA_CLI):
+        raise RuntimeError(f"Parakeet Ultra runtime not found at {ULTRA_CLI}")
+    if not os.path.isfile(ULTRA_MODEL):
+        raise RuntimeError(f"Parakeet Ultra model not found at {ULTRA_MODEL}")
+    if ULTRA_BACKEND not in {"vulkan", "cpu"}:
+        raise RuntimeError("invalid Parakeet Ultra backend; use vulkan or cpu")
+
+    began = time.monotonic()
+    results: dict[int, dict] = {}
+    notes: list[str] = []
+    failures: list[str] = []
+    cut_short = 0
+    pending = list(jobs)
+    for backend in (["vulkan", "cpu"] if ULTRA_BACKEND == "vulkan" else ["cpu"]):
+        found, stderr, returncode = _ultra_batch(pending, backend, threads, temp_dir)
+        label = "vulkan" if backend == "vulkan" else "gguf-cpu"
+        failed: list[dict] = []
+        for job in pending:
+            item = found.get(job["id"])
+            error = str(item.get("error", "")) if item else "no result"
+            if not error or error.startswith(ULTRA_CUT_SHORT):
+                cut_short += bool(error)
+                results[job["id"]] = {"text": str(item.get("text", "")), "backend": label}
+            elif error.startswith(ULTRA_EMPTY):
+                results[job["id"]] = {"text": "", "backend": label}
+            else:
+                failed.append(job)
+                if len(failed) <= 5:
+                    failures.append(f"{backend} window {job['id']}: {error}")
+        if len(failed) > 5:
+            failures.append(f"{backend}: {len(failed) - 5} more failed window(s)")
+        if failed and (returncode != 0 or stderr):
+            failures.append(f"{backend} exit {returncode}: " + "\n".join(stderr.splitlines()[-4:]))
+        pending = failed
+        if not pending:
+            break
+        if backend == "vulkan":
+            notes.append(f"Vulkan failed on {len(pending)} window(s); CPU recovery used")
+            print(
+                f"Warning: Parakeet Ultra Vulkan failed on {len(pending)} window(s); retrying on CPU.",
+                file=sys.stderr,
+            )
+    elapsed = time.monotonic() - began
+    if pending:
+        raise RuntimeError("Parakeet Ultra transcription failed:\n" + "\n".join(failures))
+    if cut_short:
+        notes.append(f"{cut_short} window(s) stopped early on repetition or length cap; partial text kept")
+        print(f"Warning: Parakeet Ultra {notes[-1]}.", file=sys.stderr)
+    return results, elapsed, "; ".join(notes)
+
+
+def _normalized_tokens(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", text)
+    result = []
+    for token in normalized.split():
+        clean = "".join(char for char in token if char.isalnum() or char in {"'", "’"})
+        if clean:
+            result.append(clean.casefold().replace("’", "'"))
+    return result
+
+
+def remove_overlap(previous: str, current: str, max_words: int = 40) -> tuple[str, int]:
+    previous_tokens = previous.split()
+    current_tokens = current.split()
+    previous_norm = _normalized_tokens(previous)
+    current_norm = _normalized_tokens(current)
+    upper = min(max_words, len(previous_norm), len(current_norm))
+    for count in range(upper, 1, -1):
+        if previous_norm[-count:] == current_norm[:count]:
+            return " ".join(current_tokens[count:]).strip(), count
+
+    # The same overlapped audio can decode with small morphology changes, for
+    # example French singular/plural agreement. Compare boundary text at the
+    # character level so those repeats do not survive into the transcript.
+    max_previous = min(max_words, len(previous_norm))
+    max_current = min(max_words, len(current_norm))
+    for previous_count in range(max_previous, 3, -1):
+        candidate_counts = [
+            previous_count,
+            previous_count - 1,
+            previous_count + 1,
+            previous_count - 2,
+            previous_count + 2,
+        ]
+        best: tuple[float, int] | None = None
+        for current_count in candidate_counts:
+            if current_count < 4 or current_count > max_current:
+                continue
+            left = " ".join(previous_norm[-previous_count:])
+            right = " ".join(current_norm[:current_count])
+            ratio = difflib.SequenceMatcher(None, left, right).ratio()
+            if best is None or ratio > best[0]:
+                best = (ratio, current_count)
+        if best is not None and best[0] >= 0.86:
+            current_count = best[1]
+            return " ".join(current_tokens[current_count:]).strip(), current_count
+    return current.strip(), 0
+
+
+def assemble_segments(
+    jobs: list[dict],
+    results: dict[int, dict],
+    turns: list[dict],
+    diarized: bool,
+) -> tuple[list[dict], int]:
+    deduped_words = 0
+    job_segments: list[dict] = []
+    previous_text_by_turn: dict[int, str] = {}
+    previous_end_by_turn: dict[int, float] = {}
+    for job in jobs:
+        text = str(results[job["id"]].get("text", "")).strip()
+        if not text or not any(char.isalnum() for char in text):
+            continue
+        previous = previous_text_by_turn.get(job["turn_id"], "")
+        if previous:
+            text, removed = remove_overlap(previous, text)
+            deduped_words += removed
+        previous_text_by_turn[job["turn_id"]] = str(results[job["id"]].get("text", "")).strip()
+        if text:
+            display_start = max(job["start"], previous_end_by_turn.get(job["turn_id"], job["start"]))
+            public_job = {key: value for key, value in job.items() if key != "path"}
+            job_segments.append({**public_job, "start": display_start, "text": text})
+        previous_end_by_turn[job["turn_id"]] = job["end"]
+
+    if not diarized:
+        return job_segments, deduped_words
+
+    by_turn: dict[int, list[dict]] = {}
+    for segment in job_segments:
+        by_turn.setdefault(segment["turn_id"], []).append(segment)
+    assembled: list[dict] = []
+    for turn_id, turn in enumerate(turns):
+        chunks = by_turn.get(turn_id, [])
+        text = " ".join(chunk["text"] for chunk in chunks).strip()
+        if text:
+            assembled.append({**turn, "text": text})
+    return assembled, deduped_words
+
+
+def markdown_output(metadata: dict, segments: list[dict], diarized: bool) -> str:
+    title = "Diarized Transcript" if diarized else "Transcript"
+    timing_note = "Parakeet Ultra word times are not used"
+    lines = [
+        f"# {title}, {metadata['source']}",
+        "",
+        f"**Duration:** {format_timestamp(metadata['duration_secs'])}",
+        f"**Language:** {metadata['language']} ({metadata['language_selection']})",
+        f"**Transcription:** {metadata['transcription_engine']}, {metadata['transcription_backend']}",
+        f"**Transcription time:** {metadata['transcription_secs']:.1f}s",
+    ]
+    if diarized:
+        lines.extend(
+            [
+                f"**Speakers detected:** {metadata['speakers_detected']}",
+                f"**Diarization:** speakrs, {metadata['diarization_backend']}",
+                f"**Diarization time:** {metadata['diarization_secs']:.1f}s",
+                f"**Timestamp precision:** speaker-turn boundaries from speakrs; {timing_note}",
+            ]
+        )
+    else:
+        lines.append(
+            f"**Timestamp precision:** Parakeet Ultra chunk windows; {timing_note}"
+        )
+    lines.extend(
+        [
+            f"**Pipeline wall time:** {metadata['pipeline_secs']:.1f}s",
+            f"**Source:** `{metadata['source']}`",
+            "",
+            "---",
+            "",
+        ]
+    )
+    for segment in segments:
+        label = segment.get("speaker") or "Transcript"
+        lines.append(f"**{label}** [{format_timestamp(segment['start'])}]")
+        lines.append(segment["text"])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def srt_output(segments: list[dict], diarized: bool) -> str:
+    blocks = []
+    for index, segment in enumerate(segments, 1):
+        text = segment["text"]
+        if diarized:
+            text = f"[{segment['speaker']}] {text}"
+        blocks.append(
+            "\n".join(
+                [
+                    str(index),
+                    f"{format_srt_timestamp(segment['start'])} --> {format_srt_timestamp(segment['end'])}",
+                    text,
+                ]
+            )
+        )
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def infer_output_format(path: str, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    suffix = Path(path).suffix.lower()
+    return {".json": "json", ".srt": "srt"}.get(suffix, "markdown")
+
+
+def default_output_path(input_path: str, diarized: bool, explicit_format: str | None) -> str:
+    extension = {"json": ".json", "srt": ".srt"}.get(explicit_format or "", ".md")
+    label = "diarized" if diarized else "transcript"
+    return os.path.join(os.path.dirname(input_path), f"{Path(input_path).stem}-{label}{extension}")
+
+
+def write_output(path: str, output_format: str, metadata: dict, segments: list[dict], diarized: bool) -> None:
+    if output_format == "json":
+        content = json.dumps({"metadata": metadata, "segments": segments}, ensure_ascii=False, indent=2) + "\n"
+    elif output_format == "srt":
+        content = srt_output(segments, diarized)
+    else:
+        content = markdown_output(metadata, segments, diarized)
+    Path(path).write_text(content, encoding="utf-8")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Witness: local file transcription with Parakeet Ultra and optional speakrs speaker labels"
+    )
+    parser.add_argument("audio_file")
+    parser.add_argument("-o", "--output")
+    parser.add_argument(
+        "-l", "--language", choices=["auto", "en", "fr"], default="auto",
+        help="EN/FR label for the output; Parakeet Ultra detects the spoken language itself (default: auto)",
+    )
+    parser.add_argument("--no-diarize", action="store_true", help="Skip speaker diarization")
+    parser.add_argument(
+        "--diarizer",
+        choices=["auto", "gpu", "cpu"],
+        default=DIARIZER,
+        help="speakrs backend (default: auto, GPU with automatic CPU fallback, "
+             "or WITNESS_DIARIZER / runtime config 'diarizer')",
+    )
+    parser.add_argument("--gpu", action="store_true", help="Alias for --diarizer gpu")
+    parser.add_argument("--format", choices=["markdown", "json", "srt"])
+    parser.add_argument(
+        "--threads", type=int, default=4,
+        help="CPU threads for the Parakeet Ultra decoder and CPU recovery",
+    )
+    parser.add_argument("--chunk-seconds", type=float, default=MAX_WINDOW_SECONDS)
+    parser.add_argument("--overlap-seconds", type=float, default=DEFAULT_OVERLAP_SECONDS)
+    parser.add_argument("--turbo", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--serial", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-m", "--model", help=argparse.SUPPRESS)
+    return parser
+
+
+def _run_pipeline(args: argparse.Namespace, ledger: RunLedger) -> int:
+    if args.threads < 1:
+        raise SystemExit("Error: --threads must be at least 1")
+    if not (1.0 <= args.chunk_seconds <= MAX_WINDOW_SECONDS):
+        raise SystemExit(f"Error: --chunk-seconds must be between 1 and {MAX_WINDOW_SECONDS:g}")
+    if not (0.0 <= args.overlap_seconds < args.chunk_seconds):
+        raise SystemExit("Error: --overlap-seconds must be non-negative and below chunk length")
+    if args.turbo or args.model:
+        print(
+            "Warning: --turbo/--model are obsolete and ignored; Witness always transcribes with Parakeet Ultra.",
+            file=sys.stderr,
+        )
+    if args.serial:
+        print("Warning: --serial is obsolete; the transcription pipeline is already sequential.", file=sys.stderr)
+
+    input_path = os.path.abspath(args.audio_file)
+    if not os.path.isfile(input_path):
+        raise SystemExit(f"Error: file not found: {input_path}")
+
+    diarized = not args.no_diarize
+    output_path = (
+        os.path.abspath(args.output)
+        if args.output
+        else default_output_path(input_path, diarized, args.format)
+    )
+    output_format = infer_output_format(output_path, args.format)
+    pipeline_started = time.monotonic()
+
+    print(f"Input:       {input_path}")
+    print(f"Output:      {output_path}")
+    print(f"Transcriber: Parakeet Ultra ({ULTRA_BACKEND}, CPU recovery available)")
+    print(f"Diarization: {'speakrs ' + args.diarizer if diarized else 'disabled'}")
+
+    ledger.set_stage("conversion")
+    with tempfile.TemporaryDirectory(prefix="witness-") as temp_dir:
+        wav_path = os.path.join(temp_dir, "input.wav")
+        print("[1/5] Converting to 16 kHz mono WAV...")
+        conversion_started = time.monotonic()
+        try:
+            convert_to_wav(input_path, wav_path)
+            samples = read_pcm_wav(wav_path)
+        finally:
+            ledger.update(conversion_secs=time.monotonic() - conversion_started)
+        audio_duration = duration_seconds(samples)
+        ledger.update(duration_secs=audio_duration)
+        if audio_duration < MIN_AUDIO_SECONDS:
+            raise SystemExit("Error: audio is too short to transcribe")
+        print(f"      Duration: {format_timestamp(audio_duration)}")
+
+        language = args.language
+        language_confidence: float | None = None
+        language_probes: int | None = None
+        language_votes: int | None = None
+        language_secs = 0.0
+        if language == "auto":
+            print("[2/5] Detecting English vs French (Whisper classifier only)...")
+            ledger.set_stage("language_detection")
+            language_started = time.monotonic()
+            try:
+                (
+                    language,
+                    language_confidence,
+                    language_secs,
+                    language_probes,
+                    language_votes,
+                ) = detect_language(samples, temp_dir)
+            finally:
+                ledger.update(language_detection_secs=time.monotonic() - language_started)
+            print(
+                f"      Detected: {language} "
+                f"(p={language_confidence:.3f}, votes={language_votes}/{language_probes}, "
+                f"{language_secs:.1f}s)"
+            )
+            language_selection = f"auto-detected p={language_confidence:.3f}; Whisper words discarded"
+        else:
+            print(f"[2/5] Language forced: {language}")
+            language_selection = "explicit"
+        ledger.update(
+            resolved_language=language,
+            language_confidence=language_confidence,
+            language_probes=language_probes,
+            language_votes=language_votes,
+            language_detection_secs=language_secs,
+        )
+
+        diarization_secs = 0.0
+        vad_secs = 0.0
+        diarization_backend = "disabled"
+        gpu_failure: str | None = None
+        print("[3/5] Detecting speech regions with Silero VAD...")
+        ledger.set_stage("vad")
+        vad_started = time.monotonic()
+        try:
+            speech_regions, vad_secs = run_vad(wav_path)
+        finally:
+            ledger.update(vad_secs=time.monotonic() - vad_started)
+        ledger.update(vad_secs=vad_secs)
+        if diarized:
+            print("      Diarizing speakers...")
+            ledger.set_stage("diarization")
+            diarization_started = time.monotonic()
+            try:
+                raw_turns, diarization_backend, diarization_secs, gpu_failure = run_diarizer(
+                    wav_path, args.diarizer
+                )
+            finally:
+                ledger.update(diarization_secs=time.monotonic() - diarization_started)
+            ledger.update(
+                diarization_secs=diarization_secs,
+                resolved_diarizer=normalize_diarizer_backend(diarization_backend),
+                fallback_class=classify_fallback(gpu_failure) if gpu_failure else "none",
+            )
+            turns = cover_timeline(
+                normalize_turns(raw_turns, audio_duration),
+                speech_regions,
+            )
+            if not turns:
+                raise SystemExit("Error: diarizer found no usable speech turns")
+            speakers = sorted({turn["speaker"] for turn in turns if turn["speaker"] != "UNKNOWN"})
+            print(
+                f"      {len(speakers)} speakers, {len(turns)} turns, "
+                f"backend={diarization_backend}, {diarization_secs:.1f}s"
+            )
+        else:
+            print("      Diarization disabled; using Silero speech regions.")
+            turns = merge_speech_regions(speech_regions)
+            speakers = []
+        unknown_speech_secs = sum(
+            max(0.0, float(turn["end"]) - float(turn["start"]))
+            for turn in turns
+            if turn.get("speaker") == "UNKNOWN"
+        )
+        ledger.update(
+            diarization_secs=diarization_secs,
+            speakers_detected=len(speakers),
+            unknown_speech_secs=unknown_speech_secs,
+        )
+
+        ledger.set_stage("windowing")
+        windowing_started = time.monotonic()
+        try:
+            jobs = build_jobs(
+                samples,
+                turns,
+                diarized,
+                args.chunk_seconds,
+                args.overlap_seconds,
+            )
+            if not jobs:
+                raise SystemExit("Error: no transcription jobs were produced")
+            ledger.update(windows=len(jobs))
+            materialize_jobs(samples, jobs, temp_dir)
+        finally:
+            ledger.update(windowing_secs=time.monotonic() - windowing_started)
+        print(
+            f"[4/5] Transcribing {len(jobs)} windows with one resident Parakeet Ultra model load..."
+        )
+        ledger.set_stage("transcription")
+        transcription_started = time.monotonic()
+        try:
+            results, transcription_secs, helper_log = run_ultra(jobs, args.threads, temp_dir)
+        finally:
+            ledger.update(transcription_secs=time.monotonic() - transcription_started)
+        segments, deduped_words = assemble_segments(jobs, results, turns, diarized)
+        if not segments:
+            raise SystemExit("Error: Parakeet Ultra returned no transcript text")
+        backends = {item.get("backend") for item in results.values()}
+        if not backends <= {"vulkan", "gguf-cpu"}:
+            raise RuntimeError("unrecognized Parakeet Ultra backend metadata")
+        transcription_backend = next(iter(backends)) if len(backends) == 1 else "mixed"
+        transcription_engine = "Parakeet Ultra GGUF"
+        ledger.update(transcription_secs=transcription_secs, segments=len(segments),
+                      transcription_backend=transcription_backend)
+        print(f"      Backend used: {transcription_backend}")
+        print(
+            f"      {len(segments)} output segments, {transcription_secs:.1f}s, "
+            f"{deduped_words} overlap words removed"
+        )
+
+        pipeline_secs = time.monotonic() - pipeline_started
+        metadata = {
+            "source": os.path.basename(input_path),
+            "duration_secs": audio_duration,
+            "language": language,
+            "language_selection": language_selection,
+            "language_detection_secs": language_secs,
+            "vad_secs": vad_secs,
+            "transcription_engine": transcription_engine,
+            "transcription_backend": transcription_backend,
+            "transcription_secs": transcription_secs,
+            "diarized": diarized,
+            "diarization_backend": diarization_backend,
+            "diarization_secs": diarization_secs,
+            "speakers_detected": len(speakers),
+            "window_secs": args.chunk_seconds,
+            "overlap_secs": args.overlap_seconds,
+            "overlap_words_removed": deduped_words,
+            "pipeline_secs": pipeline_secs,
+        }
+        if gpu_failure:
+            metadata["gpu_diarizer_fallback"] = gpu_failure.splitlines()[0]
+        if helper_log:
+            metadata["transcription_notes"] = helper_log.splitlines()[0]
+
+        print(f"[5/5] Writing {output_format} output...")
+        ledger.set_stage("output")
+        output_started = time.monotonic()
+        try:
+            write_output(output_path, output_format, metadata, segments, diarized)
+        finally:
+            ledger.update(output_secs=time.monotonic() - output_started)
+
+    ledger.complete()
+    print(f"Done: {output_path}")
+    print(f"Pipeline wall time: {metadata['pipeline_secs']:.1f}s")
+    return 0
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.gpu:
+        args.diarizer = "gpu"
+    diarized = not args.no_diarize
+    requested_format = (
+        args.format
+        or (infer_output_format(args.output, None) if args.output else "markdown")
+    )
+    ledger = RunLedger(
+        requested_language=args.language,
+        diarization_enabled=diarized,
+        requested_diarizer=args.diarizer if diarized else "disabled",
+        output_format=requested_format,
+        transcription_engine=LEDGER_ENGINE,
+    )
+    ledger.start()
+    try:
+        return _run_pipeline(args, ledger)
+    except BaseException as error:
+        ledger.fail(error)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
