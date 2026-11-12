@@ -211,7 +211,7 @@ witness path/to/english-two-speaker.wav --language en
 witness path/to/french.wav --language fr --no-diarize
 ```
 
-The 40-test unit suite covers long-window splitting, overlap deduplication (including French morphology drift), speaker-turn normalization, short-pause context merging with and without speaker labels, Silero time parsing and speakrs gap coverage, supported-language voting, GPU-to-CPU fallback, the configured diarizer default, Parakeet Ultra batch mapping and CPU retry, output extensions, JSON hygiene, SRT timing, and ledger privacy/permissions.
+The 42-test unit suite covers long-window splitting, overlap deduplication (including French morphology drift), speaker-turn normalization, short-pause context merging with and without speaker labels, Silero time parsing and speakrs gap coverage, supported-language voting, GPU-to-CPU fallback, the configured diarizer default, Parakeet Ultra batch mapping and CPU retry, output extensions, JSON hygiene, SRT timing, and ledger privacy/permissions.
 
 ## Known limitations
 
